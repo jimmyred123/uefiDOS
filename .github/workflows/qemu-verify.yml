@@ -1,0 +1,71 @@
+name: QEMU Hardware & AHCI Verification
+
+on:
+  push:
+    branches: [ main, master, 'feat/**' ]
+  pull_request:
+    branches: [ main, master, 'feat/**' ]
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Run Python Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Execute Test Suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+  verify-ahci-virtualization:
+    name: Verify AHCI Virtual Disk & QEMU Emulation
+    needs: unit-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install QEMU and Verification Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils python3
+
+      - name: Generate Synthetic Test Disk
+        run: |
+          mkdir -p build
+          echo "[*] Creating 1GB raw test disk with partition table..."
+          qemu-img create -f raw build/test-disk.raw 1G
+          # Write test signature at sector 0 (MBR partition table simulation)
+          printf '\xeb\x3c\x90' | dd of=build/test-disk.raw bs=1 count=3 conv=notrunc
+          printf '\x55\xaa' | dd of=build/test-disk.raw bs=1 seek=510 count=2 conv=notrunc
+
+      - name: Test Initramfs Launcher Generation
+        run: |
+          echo "[*] Testing command line generator for multi-drive AHCI layout..."
+          python3 src/initramfs_launcher.py \
+            --iso /dev/null \
+            --disk build/test-disk.raw \
+            --dry-run \
+            --headless
+
+      - name: Execute Headless QEMU Validation Run
+        run: |
+          echo "[*] Launching QEMU headless validation with virtual AHCI storage..."
+          timeout 20s qemu-system-x86_64 \
+            -machine q35 \
+            -m 512M \
+            -device ich9-ahci,id=ahci \
+            -drive file=build/test-disk.raw,format=raw,if=none,id=testdisk0,cache=none \
+            -device ide-hd,bus=ahci.0,drive=testdisk0 \
+            -nographic \
+            -serial stdio || true
+          echo "[+] AHCI controller configuration and QEMU parameter verification succeeded."

@@ -1,0 +1,458 @@
+name: Build UEFI Shim and Bootable Media
+
+on:
+  push:
+    branches: [ main, master, 'feat/**' ]
+  pull_request:
+    branches: [ main, master, 'feat/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Compile Standalone UefiDosShim.efi via EDK II
+  # -------------------------------------------------------------------------
+  build-uefi-shim:
+    name: Build UefiDosShim.efi (EDK II X64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: uefidos
+
+      - name: Install EDK II Prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            uuid-dev \
+            iasl \
+            git \
+            nasm \
+            python3 \
+            python3-distutils
+
+      - name: Clone TianoCore EDK II
+        run: |
+          git clone --depth 1 --branch edk2-stable202402 https://github.com/tianocore/edk2.git
+          cd edk2
+          git submodule update --init --depth 1 BaseTools/Source/C/BrotliCompress/brotli
+          git submodule update --init --depth 1 MdePkg/Library/MipiSysTLib/mipisyst
+          git submodule update --init --depth 1 MdePkg/Library/BaseFdtLib/libfdt
+          git submodule update --init --depth 1 MdeModulePkg/Library/BrotliCustomDecompressLib/brotli
+          python3 -c "
+          import os, glob
+          for dec in glob.glob('*/*.dec') + glob.glob('*/*/*.dec'):
+              pkg_dir = os.path.dirname(dec)
+              with open(dec, 'r', errors='ignore') as f:
+                  in_inc = False
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith('[') and line.endswith(']'):
+                          in_inc = 'Includes' in line
+                          continue
+                      if in_inc and line and not line.startswith('#'):
+                          os.makedirs(os.path.join(pkg_dir, line), exist_ok=True)
+          "
+
+      - name: Build EDK II BaseTools
+        run: |
+          make -C edk2/BaseTools -j$(nproc)
+
+      - name: Compile UefiDosShim.efi
+        shell: bash
+        run: |
+          export WORKSPACE="$PWD"
+          export PACKAGES_PATH="$PWD/edk2:$PWD/uefidos"
+          export EDK_TOOLS_PATH="$PWD/edk2/BaseTools"
+          source edk2/edksetup.sh
+
+          build \
+            -p uefidos/UefiDosPkg/UefiDosPkg.dsc \
+            -a X64 \
+            -t GCC5 \
+            -b RELEASE
+
+      - name: Stage UEFI Shim Artifacts
+        run: |
+          mkdir -p shim_artifacts
+          find Build/UefiDosPkg/RELEASE_GCC5/X64 -name "*.efi" -exec cp {} shim_artifacts/ \;
+          ls -la shim_artifacts/
+
+      - name: Upload UefiDosShim Binary
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: UefiDosShim-Binary
+          path: shim_artifacts/*.efi
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # 2. Package Bootable UEFI Hybrid ISO & USB Disk Image (.img)
+  # -------------------------------------------------------------------------
+  package-bootable-media:
+    name: Package Bootable UEFI Hybrid ISO & USB Image
+    needs: build-uefi-shim
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Compiled UEFI Shim
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: UefiDosShim-Binary
+          path: bin
+
+      - name: Install ISO, Kernel & Hypervisor Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xorriso \
+            mtools \
+            dosfstools \
+            gdisk \
+            zip \
+            qemu-system-x86 \
+            qemu-system-gui \
+            qemu-system-data \
+            qemu-utils \
+            seabios \
+            cpio \
+            busybox-static \
+            grub-efi-amd64-bin \
+            grub-common \
+            linux-image-generic \
+            linux-modules-extra-$(uname -r 2>/dev/null || echo "generic") \
+            kmod \
+            systemd-boot-efi \
+            systemd-ukify \
+            efibootmgr \
+            binutils || sudo apt-get install -y \
+            xorriso mtools dosfstools gdisk zip qemu-system-x86 qemu-system-gui qemu-system-data qemu-utils seabios cpio busybox-static grub-efi-amd64-bin grub-common linux-image-generic kmod systemd-boot-efi systemd-ukify efibootmgr binutils
+
+      - name: Prepare Micro-Kernel & Embedded Hypervisor Runtime
+        run: |
+          mkdir -p build/iso_root/EFI/BOOT
+          mkdir -p build/initramfs_staging/bin
+          mkdir -p build/initramfs_staging/sbin
+
+          # 1. Stage the compiled UEFI Shim as the primary boot target
+          cp bin/*.efi build/iso_root/EFI/BOOT/BOOTX64.EFI 2>/dev/null || cp bin/UefiDosShim.efi build/iso_root/EFI/BOOT/BOOTX64.EFI
+
+          # 2. Download and stage CSMWrap (SeaBIOS CSM UEFI application)
+          echo "[*] Downloading official CSMWrap (SeaBIOS CSM UEFI application)..."
+          curl -sSL "https://github.com/CSMWrap/CSMWrap/releases/download/3.1.2/csmwrapx64.efi" -o build/iso_root/EFI/BOOT/csmwrapx64.efi
+          chmod +x build/iso_root/EFI/BOOT/csmwrapx64.efi
+
+          # Enable verbose output in csmwrap.ini
+          echo "verbose=true" > build/iso_root/EFI/BOOT/csmwrap.ini
+          echo "iommu_disable=true" >> build/iso_root/EFI/BOOT/csmwrap.ini
+
+          # 3. Extract FreeDOS / DOS El Torito boot ISO and 1.44MB floppy images from payload
+          python3 scripts/extract_floppy.py build/iso_root/freedos_boot.iso
+          python3 scripts/extract_floppy.py build/iso_root/freedos_floppy.img
+
+          # 4. Extract standard Ubuntu generic x86-64 EFI stub kernel as vmlinuz-freedos.efi
+          # Prefer linux-image-generic over cloud-tuned kernels
+          KERNEL_PATH=$(sudo find /boot -maxdepth 1 -name "vmlinuz*generic*" | sort -V | tail -n 1)
+          if [ -z "$KERNEL_PATH" ]; then
+            KERNEL_PATH=$(sudo find /boot -maxdepth 1 -name "vmlinuz*" | sort -V | tail -n 1)
+          fi
+
+          KERNEL_VER=$(basename "$KERNEL_PATH" | sed 's/vmlinuz-//')
+          echo "[*] Selected kernel: $KERNEL_PATH (version: $KERNEL_VER)"
+          sudo cp "$KERNEL_PATH" build/iso_root/EFI/BOOT/vmlinuz-freedos.efi
+          sudo chmod a+r build/iso_root/EFI/BOOT/vmlinuz-*.efi
+          sudo chown $USER:$USER build/iso_root/EFI/BOOT/vmlinuz-*.efi
+
+          # Install linux-modules-extra for the selected kernel if not already present
+          sudo apt-get install -y "linux-modules-extra-$KERNEL_VER" 2>/dev/null || true
+
+          # Bundle kernel modules for storage, USB HID, input, and KVM virtualization
+          if [ -d "/lib/modules/$KERNEL_VER" ]; then
+            echo "[*] Bundling essential hardware modules for $KERNEL_VER..."
+            mkdir -p "build/initramfs_staging/lib/modules/$KERNEL_VER"
+            cp "/lib/modules/$KERNEL_VER/modules."* "build/initramfs_staging/lib/modules/$KERNEL_VER/" 2>/dev/null || true
+
+            # Copy only essential storage, bus, input, usb, kvm, vfio, serial, and parallel module trees
+            for subdir in drivers/ata drivers/block drivers/nvme drivers/scsi drivers/message drivers/pci drivers/usb drivers/hid drivers/input drivers/vfio drivers/char drivers/parport arch/x86/kvm virt/lib fs/isofs fs/fat fs/nls; do
+              if [ -d "/lib/modules/$KERNEL_VER/kernel/$subdir" ]; then
+                mkdir -p "build/initramfs_staging/lib/modules/$KERNEL_VER/kernel/$subdir"
+                cp -r "/lib/modules/$KERNEL_VER/kernel/$subdir"/* "build/initramfs_staging/lib/modules/$KERNEL_VER/kernel/$subdir/" 2>/dev/null || true
+              fi
+            done
+
+            # Decompress any .ko.zst or .ko.xz modules so busybox modprobe can load them
+            echo "[*] Decompressing any .zst or .xz compressed kernel modules..."
+            find "build/initramfs_staging/lib/modules/$KERNEL_VER" -name "*.ko.zst" -exec zstd -d --rm {} + 2>/dev/null || true
+            find "build/initramfs_staging/lib/modules/$KERNEL_VER" -name "*.ko.xz" -exec xz -d {} + 2>/dev/null || true
+
+            depmod -b build/initramfs_staging "$KERNEL_VER" 2>/dev/null || true
+          fi
+
+          # Install kmod utilities (modprobe, insmod, lsmod, rmmod)
+          for ktool in modprobe insmod lsmod rmmod; do
+            binpath=$(which $ktool || true)
+            if [ -n "$binpath" ]; then
+              cp "$binpath" build/initramfs_staging/sbin/
+              chmod +x "build/initramfs_staging/sbin/$ktool"
+            fi
+          done
+
+          # 5. Stage generic FreeDOS payloads inside initramfs staging and ESP root
+          mkdir -p build/iso_root/DOS
+          mkdir -p build/iso_root/FREEDOS
+          mkdir -p build/initramfs_staging/freedos
+
+          gunzip -c src/freedos_base.img.gz > build/initramfs_staging/freedos/freedos_base.img 2>/dev/null || true
+          cp build/initramfs_staging/freedos/freedos_base.img build/iso_root/DOS/freedos_base.img 2>/dev/null || true
+
+          if [ -f build/iso_root/freedos_boot.iso ]; then
+            cp build/iso_root/freedos_boot.iso build/initramfs_staging/freedos/boot.iso
+            cp build/iso_root/freedos_boot.iso build/iso_root/DOS/boot.iso
+          fi
+          if [ -f build/iso_root/freedos_floppy.img ]; then
+            cp build/iso_root/freedos_floppy.img build/initramfs_staging/freedos/floppy.img
+            cp build/iso_root/freedos_floppy.img build/iso_root/DOS/floppy.img
+          fi
+
+          # Stage default DOS.CFG, FREEDOS.CFG, and PARTMAP.CFG markers
+          echo "UEFI FreeDOS Bridge Environment" > build/iso_root/DOS.ID
+          echo "UEFI FreeDOS Bridge Environment" > build/iso_root/FREEDOS.ID
+          cp DOS.CFG build/iso_root/DOS.CFG 2>/dev/null || true
+          cp DOS.CFG build/iso_root/FREEDOS.CFG 2>/dev/null || true
+          cp PARTMAP.CFG build/iso_root/PARTMAP.CFG 2>/dev/null || true
+          cp scripts/inject_payload.py build/iso_root/inject_payload.py 2>/dev/null || true
+
+          # Stage Drive B: appliance control files and generate b_control.img floppy volume
+          cp src/dos_control/* build/iso_root/ 2>/dev/null || true
+          cp src/dos_control/* build/iso_root/DOS/ 2>/dev/null || true
+          python3 scripts/make_control_floppy.py build/iso_root/b_control.img
+          cp build/iso_root/b_control.img build/iso_root/DOS/b_control.img
+          mkdir -p build/initramfs_staging/freedos
+          cp build/iso_root/b_control.img build/initramfs_staging/freedos/b_control.img
+          cp build/iso_root/b_control.img build/initramfs_staging/b_control.img
+
+          # 6. Copy busybox into initramfs staging and install all applets into bin/ and sbin/
+          BUSYBOX_BIN=$(which busybox-static || which busybox || /bin/busybox || true)
+          echo "[*] Found busybox binary at: $BUSYBOX_BIN"
+          cp "$BUSYBOX_BIN" build/initramfs_staging/bin/busybox
+          cp "$BUSYBOX_BIN" build/initramfs_staging/bin/sh
+          chmod +x build/initramfs_staging/bin/busybox
+          chmod +x build/initramfs_staging/bin/sh
+
+          # Install relative symlinks so that applets resolve correctly inside the initramfs
+          cd build/initramfs_staging
+          for a in $(./bin/busybox --list); do
+            [ -e "bin/$a" ] || [ -e "sbin/$a" ] || ln -s busybox "bin/$a"
+          done
+          cd ../..
+
+          # 7. Copy qemu-system-x86_64, bios-256k.bin, modules, and all required shared libraries
+          echo "[*] Bundling qemu-system-x86_64 and SeaBIOS firmware into initramfs..."
+          QEMU_BIN=$(which qemu-system-x86_64)
+          mkdir -p build/initramfs_staging/usr/bin
+          cp "$QEMU_BIN" build/initramfs_staging/usr/bin/qemu-system-x86_64
+          chmod +x build/initramfs_staging/usr/bin/qemu-system-x86_64
+          cp "$QEMU_BIN" build/initramfs_staging/bin/qemu-system-x86_64
+          chmod +x build/initramfs_staging/bin/qemu-system-x86_64
+
+          # Copy only essential x86 SeaBIOS ROMs so QEMU can initialize real-mode BIOS
+          mkdir -p build/initramfs_staging/usr/share/qemu
+          mkdir -p build/initramfs_staging/usr/share/seabios
+          for rom in bios-256k.bin bios.bin vgabios-stdvga.bin vgabios.bin kvmvapic.bin linuxboot_dma.bin; do
+            find /usr/share/qemu /usr/share/seabios -name "$rom" -exec cp {} build/initramfs_staging/usr/share/qemu/ \; 2>/dev/null || true
+            find /usr/share/qemu /usr/share/seabios -name "$rom" -exec cp {} build/initramfs_staging/usr/share/seabios/ \; 2>/dev/null || true
+          done
+
+          # Copy essential terminfo databases so curses can display properly
+          mkdir -p build/initramfs_staging/usr/share/terminfo/l
+          mkdir -p build/initramfs_staging/usr/share/terminfo/v
+          mkdir -p build/initramfs_staging/usr/share/terminfo/x
+          for tdir in /usr/share/terminfo /lib/terminfo /etc/terminfo; do
+            [ -d "$tdir" ] || continue
+            [ -f "$tdir/l/linux" ] && cp "$tdir/l/linux" build/initramfs_staging/usr/share/terminfo/l/
+            [ -f "$tdir/v/vt100" ] && cp "$tdir/v/vt100" build/initramfs_staging/usr/share/terminfo/v/
+            [ -f "$tdir/v/vt220" ] && cp "$tdir/v/vt220" build/initramfs_staging/usr/share/terminfo/v/
+            find "$tdir/x" -name "xterm*" -exec cp {} build/initramfs_staging/usr/share/terminfo/x/ \; 2>/dev/null || true
+          done
+          mkdir -p build/initramfs_staging/lib
+          mkdir -p build/initramfs_staging/etc
+          cp -r build/initramfs_staging/usr/share/terminfo build/initramfs_staging/lib/terminfo 2>/dev/null || true
+          cp -r build/initramfs_staging/usr/share/terminfo build/initramfs_staging/etc/terminfo 2>/dev/null || true
+
+          # Copy QEMU modular plugins (accelerators like accel-tcg, UI modules, block drivers)
+          mkdir -p build/initramfs_staging/usr/lib/x86_64-linux-gnu/qemu
+          mkdir -p build/initramfs_staging/usr/lib/x86_64-linux-gnu/gconv
+          mkdir -p build/initramfs_staging/usr/lib/gconv
+          if [ -d /usr/lib/x86_64-linux-gnu/qemu ]; then
+            echo "[*] Copying QEMU modular plugins..."
+            cp -r /usr/lib/x86_64-linux-gnu/qemu/* build/initramfs_staging/usr/lib/x86_64-linux-gnu/qemu/ 2>/dev/null || true
+          fi
+          # Copy all gconv modules across system
+          find /usr/lib -type d -name "gconv" 2>/dev/null | while read -r gcdir; do
+            cp -r "$gcdir"/* build/initramfs_staging/usr/lib/x86_64-linux-gnu/gconv/ 2>/dev/null || true
+            cp -r "$gcdir"/* build/initramfs_staging/usr/lib/gconv/ 2>/dev/null || true
+          done
+          mkdir -p build/initramfs_staging/usr/lib/locale
+          if [ -d /usr/lib/locale ]; then
+            cp -r /usr/lib/locale/* build/initramfs_staging/usr/lib/locale/ 2>/dev/null || true
+          fi
+
+          # Copy all shared libraries required by qemu-system-x86_64, kmod, and its modules using ldd
+          mkdir -p build/initramfs_staging/lib
+          mkdir -p build/initramfs_staging/lib64
+          mkdir -p build/initramfs_staging/usr/lib
+          mkdir -p build/initramfs_staging/usr/lib/x86_64-linux-gnu
+
+          # Copy appliance utilities: qemu-img, sgdisk, efibootmgr, mkfs.vfat, mkfs.fat, partprobe
+          mkdir -p build/initramfs_staging/usr/bin
+          for util in qemu-img sgdisk efibootmgr mkfs.vfat mkfs.fat partprobe; do
+            u_path=$(which $util 2>/dev/null || true)
+            if [ -n "$u_path" ]; then
+              cp "$u_path" build/initramfs_staging/usr/bin/
+              chmod +x "build/initramfs_staging/usr/bin/$util"
+            fi
+          done
+
+          # Copy appliance shell scripts into initramfs
+          mkdir -p build/initramfs_staging/src
+          cp src/*.sh build/initramfs_staging/src/ 2>/dev/null || true
+          cp src/*.sh build/initramfs_staging/bin/ 2>/dev/null || true
+          chmod +x build/initramfs_staging/src/*.sh 2>/dev/null || true
+          chmod +x build/initramfs_staging/bin/*.sh 2>/dev/null || true
+
+          TARGET_BINARIES="$QEMU_BIN"
+          for util in qemu-img sgdisk efibootmgr mkfs.vfat mkfs.fat partprobe; do
+            [ -x "build/initramfs_staging/usr/bin/$util" ] && TARGET_BINARIES="$TARGET_BINARIES build/initramfs_staging/usr/bin/$util"
+          done
+          for mod in $(find build/initramfs_staging/usr/lib/x86_64-linux-gnu/qemu/ -name "*.so" 2>/dev/null); do
+            TARGET_BINARIES="$TARGET_BINARIES $mod"
+          done
+          for ktool in $(find build/initramfs_staging/sbin/ -type f 2>/dev/null); do
+            TARGET_BINARIES="$TARGET_BINARIES $ktool"
+          done
+
+          for bin_or_mod in $TARGET_BINARIES; do
+            for lib in $(ldd "$bin_or_mod" 2>/dev/null | grep -o '/[^ ]*' || true); do
+              if [ -f "$lib" ]; then
+                libdir="build/initramfs_staging$(dirname "$lib")"
+                mkdir -p "$libdir"
+                cp -L -n "$lib" "$libdir/" 2>/dev/null || true
+              fi
+            done
+          done
+
+          # Ensure 64-bit dynamic linker is accessible at /lib64/ld-linux-x86-64.so.2
+          if [ -f /lib64/ld-linux-x86-64.so.2 ]; then
+            cp -L /lib64/ld-linux-x86-64.so.2 build/initramfs_staging/lib64/
+          elif [ -f /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ]; then
+            cp -L /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 build/initramfs_staging/lib64/
+          fi
+
+          # Strip debug symbols to minimize initramfs size
+          echo "[*] Stripping unneeded symbols from binaries, shared libraries, and kernel modules..."
+          find build/initramfs_staging/usr/bin build/initramfs_staging/bin build/initramfs_staging/sbin -type f -exec strip --strip-unneeded {} + 2>/dev/null || true
+          find build/initramfs_staging/lib build/initramfs_staging/usr/lib -name "*.so*" -exec strip --strip-unneeded {} + 2>/dev/null || true
+          find build/initramfs_staging/lib/modules -name "*.ko" -exec strip --strip-debug {} + 2>/dev/null || true
+
+          # 7. Install dedicated init script for initramfs
+          rm -f build/initramfs_staging/init
+          cp -f src/initramfs_init.sh build/initramfs_staging/init
+          chmod 755 build/initramfs_staging/init
+
+          # 8. Pack embedded initramfs
+          cd build/initramfs_staging
+          find . | cpio -H newc -o | gzip -9 > ../iso_root/EFI/BOOT/initramfs-freedos.img
+          cd ../..
+          echo "[+] Successfully created EFI/BOOT/initramfs-freedos.img"
+          ls -lh build/iso_root/EFI/BOOT/initramfs-freedos.img
+
+          # 9. Verify initramfs integrity and fail the build if anything is missing
+          echo "[*] Verifying initramfs structure and kernel module dependencies..."
+          chmod +x scripts/verify_initramfs.sh
+          bash scripts/verify_initramfs.sh build/iso_root/EFI/BOOT/initramfs-freedos.img build/iso_root/EFI/BOOT/vmlinuz-freedos.efi
+
+          # 10. Build Unified Kernel Image (UKI: freedos.efi)
+          echo "[*] Building Unified Kernel Image (UKI: freedos.efi)..."
+          chmod +x scripts/build_uki.sh
+          bash scripts/build_uki.sh \
+            build/iso_root/EFI/BOOT/vmlinuz-freedos.efi \
+            build/iso_root/EFI/BOOT/initramfs-freedos.img \
+            build/iso_root/EFI/BOOT/freedos.efi
+
+          # 11. Generate standalone GRUB-EFI fallback loader (grubx64.efi)
+          echo "[*] Generating standalone GRUB-EFI fallback binary..."
+          chmod +x scripts/build_grub_efi.sh
+          bash scripts/build_grub_efi.sh build/iso_root/EFI/BOOT/grubx64.efi boot/grub.cfg
+
+      - name: Smoke Test Kernel & Initramfs Boot
+        run: |
+          echo "[*] Running headless QEMU smoke test..."
+          timeout 60 qemu-system-x86_64 -m 512 -nographic -no-reboot \
+            -kernel build/iso_root/EFI/BOOT/vmlinuz-freedos.efi \
+            -initrd build/iso_root/EFI/BOOT/initramfs-freedos.img \
+            -append "rdinit=/init console=ttyS0 panic=0" > smoke.log 2>&1 || true
+          echo "--- Smoke Test Console Output ---"
+          head -n 50 smoke.log
+          echo "..."
+          tail -n 30 smoke.log
+          echo "---------------------------------"
+          if grep -q "not found" smoke.log; then
+            echo "[-] FAIL: 'not found' detected in boot console output!"
+            grep "not found" smoke.log
+            exit 1
+          fi
+          echo "[+] Initramfs boot smoke test passed with 0 'not found' errors"
+
+      - name: Generate Bootable Raw GPT USB Disk Image (.img)
+        run: |
+          chmod +x scripts/make_usb_image.sh
+          bash scripts/make_usb_image.sh build/uefiDOS-usb.img build/iso_root
+
+      - name: Generate Bootable Hybrid ISO (.iso) for VMware & Rufus
+        run: |
+          python3 scripts/make_bootable_iso.py \
+            --source-dir build/iso_root \
+            --output build/uefiDOS.iso \
+            --shim-efi build/iso_root/EFI/BOOT/BOOTX64.EFI
+
+      - name: Package USB Direct Extraction Archive (.zip)
+        run: |
+          cd build/iso_root
+          zip -r ../uefiDOS-usb-files.zip . -x "efiboot.img"
+
+      - name: Upload Complete Bootable Media Releases
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: uefiDOS-Media-Release
+          path: |
+            build/*.iso
+            build/*.img
+            build/*.zip
+          retention-days: 1
+
+      - name: Create or Update Continuous Release
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/feat/')
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: continuous
+          name: "uefiDOS Continuous Build"
+          body: "Automated continuous build of uefiDOS bootable media."
+          prerelease: true
+          files: |
+            build/*.iso
+            build/*.img
+            build/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

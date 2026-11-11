@@ -1,0 +1,25 @@
+# Binaries and ISO images
+*.iso
+*.img
+*.qcow2
+*.vmdk
+
+# Git binary exclusions & user payloads
+payloads/
+*.exe
+
+# Build outputs & artifacts
+build/
+dist/
+out/
+bin/*
+!bin/UefiDosShim.efi
+artifacts/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

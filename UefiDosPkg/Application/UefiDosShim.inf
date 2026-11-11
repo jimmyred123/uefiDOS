@@ -1,0 +1,43 @@
+## @file
+#  INF file for UefiDosShim application
+#
+#  Copyright (c) 2026, uefiDOS Contributors. All rights reserved.
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = UefiDosShim
+  FILE_GUID                      = b8a34291-7681-4b13-91c2-ef4821a8de11
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  UefiDosShim.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  UefiDosPkg/UefiDosPkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  UefiRuntimeServicesTableLib
+  UefiLib
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib
+  PrintLib
+  DevicePathLib
+
+[Protocols]
+  gEfiLoadedImageProtocolGuid
+  gEfiPciRootBridgeIoProtocolGuid
+  gEfiPciIoProtocolGuid
+  gEfiSimpleFileSystemProtocolGuid
+  gEfiBlockIoProtocolGuid
+
+[Guids]
+  gEfiAcpi20TableGuid
+  gEfiAcpi10TableGuid
